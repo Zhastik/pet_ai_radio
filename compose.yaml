@@ -1,0 +1,13 @@
+services:
+  radio:
+    build: .
+    init: true
+    ports:
+      - "127.0.0.1:${RADIO_PORT:-8000}:8000"
+    volumes:
+      - model-cache:/var/cache/ai-radio
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+volumes:
+  model-cache:

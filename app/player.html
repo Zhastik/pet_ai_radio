@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI Radio</title>
+<style>
+  :root { color-scheme: dark; font-family: system-ui, sans-serif; background: #171619; color: #f7efdf; }
+  body { margin: 0; min-height: 100vh; display: grid; place-items: center; }
+  main { width: min(32rem, calc(100% - 2rem)); }
+  h1 { font: 400 clamp(3rem, 12vw, 6rem)/1 Georgia, serif; margin: 0 0 1.5rem; }
+  form { border: 1px solid #524943; background: #231f23; padding: clamp(1rem, 5vw, 2rem); border-radius: 1rem; }
+  label { display: block; margin-bottom: .5rem; }
+  select, button { font: inherit; padding: .7rem 1rem; border: 1px solid #6a5f58; border-radius: .5rem; }
+  select { background: #171619; color: inherit; width: 100%; }
+  div { display: flex; gap: .6rem; margin-top: 1rem; flex-wrap: wrap; }
+  button { background: #ffc990; color: #231717; cursor: pointer; font-weight: 600; }
+  button + button { background: transparent; color: inherit; }
+  button:disabled { opacity: .45; cursor: default; }
+  p { color: #ebcbb1; min-height: 1.5em; margin-bottom: 0; }
+</style>
+</head>
+<body>
+<main>
+  <h1>AI Radio</h1>
+  <form>
+    <label for="genre">Жанр</label>
+    <select id="genre" required></select>
+    <div>
+      <button id="start" disabled>Слушать</button>
+      <button id="stop" type="button" disabled>Остановить</button>
+    </div>
+    <p id="status" role="status">Загружаем жанры…</p>
+  </form>
+  <audio preload="auto"></audio>
+</main>
+<script>
+  const form = document.querySelector("form");
+  const audio = document.querySelector("audio");
+  const genre = document.querySelector("#genre");
+  const start = document.querySelector("#start");
+  const stop = document.querySelector("#stop");
+  const status = document.querySelector("#status");
+  let station;
+
+  function reset() {
+    if (!station) return;
+    station.controller.abort();
+    clearTimeout(station.retryTimer);
+    audio.pause();
+    audio.removeAttribute("src");
+    audio.load();
+    URL.revokeObjectURL(station.current);
+    URL.revokeObjectURL(station.next);
+    station = undefined;
+    start.textContent = "Слушать";
+    start.disabled = false;
+    stop.disabled = true;
+  }
+
+  async function play(currentStation) {
+    start.disabled = true;
+    try {
+      await audio.play();
+      if (station !== currentStation) return;
+      start.textContent = "Слушать";
+      status.textContent = `В эфире · трек ${currentStation.count}`;
+      if (!currentStation.next && !currentStation.loading) prepare(currentStation);
+    } catch (error) {
+      if (station !== currentStation) return;
+      if (error.name === "NotAllowedError") {
+        start.textContent = "Воспроизвести";
+        start.disabled = false;
+        status.textContent = "Трек готов. Нажмите «Воспроизвести».";
+      } else {
+        reset();
+        status.textContent = "Не удалось воспроизвести трек. Попробуйте снова.";
+      }
+    }
+  }
+
+  function advance(currentStation) {
+    if (!currentStation.next) {
+      status.textContent = "Генерируем следующий трек…";
+      if (!currentStation.loading) prepare(currentStation);
+      return;
+    }
+    URL.revokeObjectURL(currentStation.current);
+    currentStation.current = currentStation.next;
+    currentStation.next = null;
+    currentStation.waiting = false;
+    currentStation.count += 1;
+    audio.src = currentStation.current;
+    play(currentStation);
+  }
+
+  async function prepare(currentStation) {
+    currentStation.loading = true;
+    start.disabled = true;
+    try {
+      const response = await fetch(`/api/genres/${currentStation.genre}/tracks`, {
+        method: "POST",
+        signal: currentStation.controller.signal,
+        cache: "no-store",
+      });
+      if (response.status === 503 && response.headers.has("Retry-After")) {
+        if (station === currentStation) {
+          const seconds = Number(response.headers.get("Retry-After")) || 2;
+          currentStation.retryTimer = setTimeout(() => prepare(currentStation), seconds * 1000);
+        }
+        return;
+      }
+      if (!response.ok) throw new Error("Track request failed");
+      const track = await response.blob();
+      if (station !== currentStation) return;
+      currentStation.next = URL.createObjectURL(track);
+      currentStation.loading = false;
+      if (currentStation.waiting) advance(currentStation);
+    } catch {
+      if (station !== currentStation) return;
+      currentStation.loading = false;
+      start.textContent = "Повторить";
+      start.disabled = false;
+      status.textContent = "Не удалось сгенерировать трек. Нажмите «Повторить».";
+    }
+  }
+
+  audio.addEventListener("ended", () => {
+    if (!station) return;
+    station.waiting = true;
+    advance(station);
+  });
+
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    if (station?.genre === genre.value) {
+      if (start.textContent === "Воспроизвести") play(station);
+      if (start.textContent === "Повторить" && !station.loading) prepare(station);
+      return;
+    }
+    reset();
+    station = {
+      genre: genre.value,
+      controller: new AbortController(),
+      count: 0,
+      waiting: true,
+    };
+    stop.disabled = false;
+    status.textContent = "Генерируем первый трек…";
+    prepare(station);
+  });
+
+  genre.addEventListener("change", () => {
+    if (station) form.requestSubmit();
+  });
+  stop.addEventListener("click", () => {
+    reset();
+    status.textContent = "Эфир остановлен.";
+  });
+
+  async function loadGenres() {
+    try {
+      const response = await fetch("/api/genres");
+      if (!response.ok) throw new Error("Genre request failed");
+      for (const item of await response.json()) {
+        genre.add(new Option(item.name, item.id));
+      }
+      start.disabled = false;
+      status.textContent = "";
+    } catch {
+      status.textContent = "Не удалось загрузить жанры. Обновите страницу.";
+    }
+  }
+
+  loadGenres();
+</script>
+</body>
+</html>
